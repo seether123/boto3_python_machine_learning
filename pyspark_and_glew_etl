@@ -1,0 +1,40 @@
+import sys
+import json
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, to_json, struct
+ 
+# Initialize Glue Context
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+ 
+# Read from Glue Catalog (Data discovered by Crawler)
+customers_df = glueContext.create_dynamic_frame.from_catalog(database="etl_catalog_db", table_name="customers").toDF()
+orders_df = glueContext.create_dynamic_frame.from_catalog(database="etl_catalog_db", table_name="orders").toDF()
+ 
+# Transform: Merge Customers & Orders
+merged_df = customers_df.join(orders_df, customers_df.CustomerID == orders_df.CustomerID) \
+    .select(customers_df.CustomerID, customers_df.Fullname, orders_df.SalesOrderID, orders_df.OrderDate, orders_df.TotalDue)
+ 
+# Convert to Kafka-Compatible JSON
+json_df = merged_df.withColumn(
+    "value",
+    to_json(struct(col("CustomerID"), col("Fullname"), col("SalesOrderID"), col("OrderDate"), col("TotalDue")))
+).select("value")
+ 
+# Write to Kafka
+json_df \
+    .write \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "b-1.msk-cluster.abcd1234.kafka.us-west-2.amazonaws.com:9092") \
+    .option("topic", "customer_orders") \
+    .save()
+ 
+job.commit()
