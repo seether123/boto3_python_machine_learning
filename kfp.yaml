@@ -1,0 +1,142 @@
+import kfp
+from kfp import dsl
+
+# ----------------- 📌 Step 1: Data Preprocessing (Using PySpark) -----------------
+@dsl.component(base_image="your-docker-repo/pyspark:latest")  # Custom PySpark Image
+def preprocess_data(input_data: str, output_train: str, output_test: str) -> None:
+    """Preprocess raw data using PySpark, split into train & test, and normalize features."""
+    from pyspark.sql import SparkSession
+    from pyspark.sql.functions import col
+    from pyspark.ml.feature import MinMaxScaler, VectorAssembler
+    from pyspark.sql import functions as F
+    import os
+
+    # Initialize Spark session
+    spark = SparkSession.builder.appName("FraudPreprocessing").getOrCreate()
+
+    # Load dataset
+    df = spark.read.csv(input_data, header=True, inferSchema=True)
+
+    # Convert 'Class' column to integer
+    df = df.withColumn("Class", col("Class").cast("integer"))
+
+    # Handle missing values (Fill with column median)
+    df = df.fillna(df.select([F.median(col(c)).alias(c) for c in df.columns]).first().asDict())
+
+    # Normalize 'Amount' feature using MinMaxScaler
+    vector_assembler = VectorAssembler(inputCols=["Amount"], outputCol="AmountVec")
+    scaler = MinMaxScaler(inputCol="AmountVec", outputCol="NormalizedAmount")
+
+    df = vector_assembler.transform(df)
+    df = scaler.fit(df).transform(df)
+
+    # Select required features
+    feature_columns = ["NormalizedAmount"] + [f"V{i}" for i in range(1, 29)] + ["Class"]
+    df = df.select(feature_columns)
+
+    # Split into train and test datasets (80-20 split)
+    train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+
+    # Save processed data to output paths
+    train_path = os.path.join(output_train, "train.csv")
+    test_path = os.path.join(output_test, "test.csv")
+
+    train_df.write.csv(train_path, header=True, mode="overwrite")
+    test_df.write.csv(test_path, header=True, mode="overwrite")
+
+    # Stop Spark session
+    spark.stop()
+
+# ----------------- 📌 Step 2: Model Training (XGBoost) -----------------
+@dsl.component(base_image="your-docker-repo/custom-xgboost:latest")  # Custom XGBoost Image
+def train_model(train_data: str, model_output: str) -> str:
+    """Train an XGBoost model and save it."""
+    import xgboost as xgb
+    import pandas as pd
+    import pickle
+    import os
+
+    # Load training data
+    df = pd.read_csv(train_data)
+    X = df.drop("Class", axis=1)  # Features
+    y = df["Class"]  # Target variable
+
+    # Train model
+    model = xgb.XGBClassifier(objective="binary:logistic", num_round=100)
+    model.fit(X, y)
+
+    # Save trained model
+    model_path = os.path.join(model_output, "model.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+
+    return model_path  # Return path to the trained model
+
+# ----------------- 📌 Step 3: Model Evaluation -----------------
+@dsl.component(base_image="python:3.8")  # Python base image
+def evaluate_model(model_path: str, test_data: str) -> float:
+    """Evaluate the trained model and return accuracy."""
+    import xgboost as xgb
+    import pandas as pd
+    import pickle
+    from sklearn.metrics import accuracy_score
+
+    # Load trained model
+    with open(model_path, "rb") as f:
+        model = pickle.load(f)
+
+    # Load test dataset
+    df = pd.read_csv(test_data)
+    X_test = df.drop("Class", axis=1)
+    y_test = df["Class"]
+
+    # Make predictions
+    preds = model.predict(X_test)
+    accuracy = accuracy_score(y_test, preds)
+
+    return accuracy  # Return model accuracy
+
+# ----------------- 📌 Step 4: Model Registration -----------------
+@dsl.component(base_image="python:3.8")  # Python base image
+def register_model(model_path: str) -> None:
+    """Register the model if accuracy is above threshold."""
+    import shutil
+
+    # Simulating model registry (In real scenario, push to MLflow/S3)
+    registry_path = "/mnt/model-registry/model.pkl"
+    shutil.copy(model_path, registry_path)
+
+# ----------------- 📌 Kubeflow Pipeline Definition -----------------
+@dsl.pipeline(
+    name="Kubeflow_Fraud_Detection",
+    description="Pipeline for Fraud Detection using PySpark, XGBoost, and SageMaker"
+)
+def ml_pipeline(input_data: str, accuracy_threshold: float = 0.8):
+    # Step 1: Preprocessing
+    preprocess_op = preprocess_data(
+        input_data=input_data,
+        output_train="/mnt/data/train.csv",
+        output_test="/mnt/data/test.csv"
+    )
+
+    # Step 2: Training
+    train_op = train_model(
+        train_data=preprocess_op.outputs["output_train"],
+        model_output="/mnt/model"
+    )
+
+    # Step 3: Evaluation
+    evaluate_op = evaluate_model(
+        model_path=train_op.output,
+        test_data=preprocess_op.outputs["output_test"]
+    )
+
+    # Step 4: Conditional Model Registration
+    with dsl.Condition(evaluate_op.output >= accuracy_threshold):
+        register_op = register_model(
+            model_path=train_op.output
+        )
+
+# ----------------- 📌 Compile & Run the Pipeline -----------------
+if __name__ == "__main__":
+    kfp.compiler.Compiler().compile(ml_pipeline, "fraud_detection_pipeline.yaml")
