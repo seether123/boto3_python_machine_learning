@@ -1,0 +1,10 @@
+
+aws s3 cp preprocess.py s3://your-bucket/scripts/preprocess.py
+
+import boto3
+
+client = boto3.client("glue")
+response = client.start_job_run(
+    JobName="fraud-preprocessing",
+    Arguments={"--S3_INPUT": "s3://your-bucket/fraud-detection/raw_data.csv"}
+)
